@@ -109,7 +109,7 @@ def parse_invoice_data(text, pdf_path=None):
         'date': r'(?:Invoice\s*Date\s*:?\s*|DATE\s*:?\s*|Date\s*:?\s*)([\d/.\-]+)',
         # 'receiver_name': r'(?:Bill\s*To|Receiver|Billed\s*to)\s*[:.-]\s*([A-Za-z0-9\s.,]+)', # Commented out
         # 'receiver_gst': r'(?:GSTIN\s*:?\s*|GST\s*#?\s*:?\s*)([A-Z0-9]{15})', # Commented out - too generic, picks up sender GST
-        'taxrate': r'(?:CGST|SGST)\s*(\d+(?:\.\d+)?)\s*%',
+        'taxrate': r'(?:CGST|SGST|GST)\s*[(@:\s]*(\d+(?:\.\d+)?)\s*%',
         'cgst': r'CGST\d*\s*\(\d+%\)\s*([\d,]+\.?\d*)',
         'sgst': r'SGST\d*\s*\(\d+%\)\s*([\d,]+\.?\d*)',
         'invoice_value': r'(?:Total\s*:?\s*|TOTAL\s*:?\s*)(?:Rs\.?|INR|₹)?\s*([\d,]+\.?\d*)',
@@ -124,6 +124,24 @@ def parse_invoice_data(text, pdf_path=None):
             # Clean up the value
             value = re.sub(r'[^\w\s.,/-]', '', value)  # Remove special characters except common ones
             common_data[field] = value
+
+    # Calculate taxrate as SUM of CGST + SGST percentages
+    # Extract CGST percentage - looks for CGST followed by % on same line
+    cgst_pattern = r'CGST[^\n]*?(\d+(?:\.\d+)?)\s*%'
+    cgst_match = re.search(cgst_pattern, text, re.IGNORECASE)
+    cgst_percent = float(cgst_match.group(1)) if cgst_match else 0
+    
+    # Extract SGST percentage - looks for SGST followed by % on same line
+    sgst_pattern = r'SGST[^\n]*?(\d+(?:\.\d+)?)\s*%'
+    sgst_match = re.search(sgst_pattern, text, re.IGNORECASE)
+    sgst_percent = float(sgst_match.group(1)) if sgst_match else 0
+    
+    # Total taxrate = CGST + SGST
+    total_taxrate = cgst_percent + sgst_percent
+    if total_taxrate > 0:
+        # Format: remove .0 if it's a whole number, otherwise keep decimals
+        common_data['taxrate'] = str(int(total_taxrate)) if total_taxrate == int(total_taxrate) else str(total_taxrate)
+    # If no CGST/SGST found, leave taxrate empty
 
     # Specialized extraction for Receiver Name
     # Matches "Bill To" followed optionally by : or . and surrounding whitespace/newlines, then captures the next meaningful lines (up to 3)
@@ -252,9 +270,25 @@ def parse_invoice_data(text, pdf_path=None):
                             # Skip header rows
                             if row_idx <= header_row_idx:
                                 continue
-                            # Skip sub-header row if it looks like one (contains 'Amt', '%')
-                            if row_idx == header_row_idx + 1 and any(x in str(row).lower() for x in ['amt', '%']):
-                                continue
+                            # Skip sub-header row if it looks like one (mostly contains 'Amt', '%' and NO numeric quantities/rates)
+                            # A real data row will have at least qty or rate values
+                            if row_idx == header_row_idx + 1:
+                                row_str = str(row).lower()
+                                # Safe extraction helper (moved here for use in check)
+                                def get_val_check(idx):
+                                    if idx is not None and isinstance(idx, int) and 0 <= idx < len(row):
+                                        return row[idx]
+                                    return ''
+                                
+                                qty_check = get_val_check(col_map.get('qty'))
+                                rate_check = get_val_check(col_map.get('rate'))
+                                has_qty = qty_check and re.search(r'\d+\.?\d*', str(qty_check))
+                                has_rate = rate_check and re.search(r'\d+[,\d]*\.?\d+', str(rate_check))
+                                
+                                # If next row has % or 'Amt' but NO qty/rate numbers, it's a sub-header
+                                is_subheader = ('amt' in row_str or '%' in row_str) and not (has_qty or has_rate)
+                                if is_subheader:
+                                    continue
 
                             # Safe extraction helper
                             def get_val(idx):
